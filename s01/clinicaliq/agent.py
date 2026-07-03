@@ -40,7 +40,11 @@ from .state import ClinicalIQState
 
 def build_graph():
     """Build and compile the ClinicalIQ LangGraph graph."""
-    raise NotImplementedError("TODO 5: implement build_graph() in clinicaliq/agent.py")
+    builder = StateGraph(ClinicalIQState)
+    builder.add_node("respond", respond)
+    builder.set_entry_point("respond")
+    builder.add_edge("respond", END)
+    return builder.compile()
 
 
 # Module-level graph instance required by langgraph.json for LangGraph Studio.
