@@ -7,9 +7,9 @@ Use it to set up the environment before any other module loads.
 """
 import os
 
-from dotenv import load_dotenv
-
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # TODO 1 of 5 -- Environment setup
@@ -29,4 +29,4 @@ os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 #
 # ---------------------------------------------------------------------------
 
-load_dotenv()
+

@@ -9,9 +9,14 @@ Nothing here makes API calls -- it's pure configuration.
 # Model settings (provided -- no changes needed)
 # ---------------------------------------------------------------------------
 
+from pathlib import Path
+
 MODEL_NAME  = "meta-llama/llama-4-scout-17b-16e-instruct"
 TEMPERATURE = 0.3
 MAX_TOKENS  = 300
+
+classifier_TEMPERATURE = 0.0
+classifier_MAX_TOKENS  = 10
 
 # ---------------------------------------------------------------------------
 # TODO 2 of 5 -- System prompt
@@ -105,3 +110,44 @@ Output format:
 Keep all responses under 150 words.
 Sign off every response as: ClinicalIQ | Apollo Health Clinic
 """
+
+CLASSIFY_SYSTEM_PROMPT = """You are a query classifier for ClinicalIQ, the Apollo Health Clinic assistant.
+ 
+Classify the customer's query into exactly one category:
+ 
+SIMPLE       : A direct factual question about a specific Apollo Health Clinic services, doctors availability.
+               Examples: "When is the Cardiology department open?", "What is the latest appointment time?",
+               "What details do you need for booking an appointment"
+ 
+COMPLEX      : A question requiring services comparison, lab report assessment,
+               doctor's expertise, or a recommendation based on the patient's condition.
+               Examples: "Should I take an additional lab test?",
+               "Which lab test would you recommend?",
+               "Which doctor would be best for my condition?"
+ 
+OUT_OF_SCOPE : A request unrelated to Apollo Health Clinic services.
+               Examples: "Write me a poem", "Compare Apollo Health Clinic with another hospital",
+               "What are the special offers today?"
+ 
+Reply with exactly one word: SIMPLE, COMPLEX, or OUT_OF_SCOPE. No explanation."""
+
+ESCALATE_RESPONSE = (
+    "That is a great question -- it involves your personal health condition "
+    "and deserves personalised advice.\n\n"
+    "I recommend speaking with an Apollo Health Clinic doctor who can review your "
+    "full case history and recommend the best option for you.\n\n"
+    "Please visit your nearest Apollo Health Clinic branch or call us on 1800-103-1906 "
+    "(toll-free, Monday to Saturday, 9 AM to 6 PM).\n\n"
+    "ClinicalIQ | Apollo Health Clinic"
+)
+ 
+DECLINE_RESPONSE = (
+    "I can only help with Apollo Health Clinic services -- appointments, "
+    "lab tests, and branch information. For other topics, please "
+    "contact the relevant service provider.\n\n"
+    "ClinicalIQ | Apollo Health Clinic"
+)
+ 
+
+DATA_DIR  = Path(__file__).parent.parent.parent / "data"
+CHECKPOINT_DB = DATA_DIR / "checkpoint.db"

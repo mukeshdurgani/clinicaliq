@@ -26,7 +26,8 @@ from typing import TypedDict
 class ClinicalIQState(TypedDict):
     customer_message: str
     response: str
-
+    history: list[dict]  # List of dicts with keys 'role' and 'content'
+    query_type: str
 
 # Guard: raises at import time if the fields haven't been defined yet.
 if "customer_message" not in ClinicalIQState.__annotations__:
