@@ -11,7 +11,8 @@ Nothing here makes API calls -- it's pure configuration.
 
 from pathlib import Path
 
-MODEL_NAME  = "meta-llama/llama-4-scout-17b-16e-instruct"
+# MODEL_NAME  = "meta-llama/llama-4-scout-17b-16e-instruct" (old model deprecated as on 17July2026)
+MODEL_NAME  = "meta-llama/llama-3.3-70b-versatile"
 TEMPERATURE = 0.3
 MAX_TOKENS  = 300
 
