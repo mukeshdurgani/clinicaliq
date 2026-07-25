@@ -28,7 +28,9 @@ class ClinicalIQState(TypedDict):
     response: str
     history: list[dict]  # List of dicts with keys 'role' and 'content'
     query_type: str
-
+    retrieved_docs: list[str]   #The top 2-3 chunks from ChormaDB will be referenced here in retreived_docs. 
+                                #This will be used to provide context to the LLM when generating a response.
+    
 # Guard: raises at import time if the fields haven't been defined yet.
 if "customer_message" not in ClinicalIQState.__annotations__:
     raise NotImplementedError(

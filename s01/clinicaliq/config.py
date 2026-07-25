@@ -12,7 +12,7 @@ Nothing here makes API calls -- it's pure configuration.
 from pathlib import Path
 
 # MODEL_NAME  = "meta-llama/llama-4-scout-17b-16e-instruct" (old model deprecated as on 17July2026)
-MODEL_NAME  = "meta-llama/llama-3.3-70b-versatile"
+MODEL_NAME  = "llama-3.3-70b-versatile"
 TEMPERATURE = 0.3
 MAX_TOKENS  = 300
 
@@ -50,6 +50,30 @@ classifier_MAX_TOKENS  = 10
 # Hint: use a triple-quoted string -- SYSTEM_PROMPT = """..."""
 #
 # ---------------------------------------------------------------------------
+
+
+# ESCALATE_RESPONSE is defined before SYSTEM_PROMPT so it can be embedded in rule 6.
+#
+# NOTE: this single response now covers BOTH true emergencies and routine
+# symptom/diagnosis/medication questions (see ESCALATE category in
+# CLASSIFY_SYSTEM_PROMPT below) -- nodes.escalate() returns it verbatim with
+# no LLM call in between. It must therefore lead with the emergency
+# instruction: routing an emergency here must never look like a downgrade
+# from the old behaviour, where the LLM applied SYSTEM_PROMPT's "call 112"
+# rule itself. If you change the wording, keep the 112/ER line first.
+ESCALATE_RESPONSE = (
+    "If this is a medical emergency (e.g. chest pain, difficulty breathing, "
+    "severe bleeding, or loss of consciousness), please call 112 or go to "
+    "your nearest emergency room immediately.\n\n"
+    "For non-emergency questions like this, that is a great question -- it "
+    "involves your personal health situation and deserves personalised advice.\n\n"
+    "I recommend speaking with a Doctor or a nurse practioner who can review your "
+    "full health record and recommend the best option for you.\n\n"
+    "Please visit your nearest clinic or call us on 1800-103-1906 "
+    "(toll-free, Monday to Saturday, 9 AM to 6 PM).\n\n"
+    "ClinicalIQ | Apollo Health Clinic"
+)
+
 
 SYSTEM_PROMPT = """
 You are ClinicalIQ, the friendly and professional AI patient-guidance
@@ -112,35 +136,63 @@ Keep all responses under 150 words.
 Sign off every response as: ClinicalIQ | Apollo Health Clinic
 """
 
-CLASSIFY_SYSTEM_PROMPT = """You are a query classifier for ClinicalIQ, the Apollo Health Clinic assistant.
- 
-Classify the customer's query into exactly one category:
- 
-SIMPLE       : A direct factual question about a specific Apollo Health Clinic services, doctors availability.
+# ---------------------------------------------------------------------------
+# ESCALATE routing toggle
+# ---------------------------------------------------------------------------
+# Controls whether the classifier can route symptom / diagnosis / medication /
+# emergency queries straight to nodes.escalate() -- deterministically, before
+# retrieval or LLM generation ever run.
+#
+# TO DISABLE: set this to False. That's the only change needed --
+#   - CLASSIFY_SYSTEM_PROMPT below regenerates itself without the ESCALATE
+#     category (the classifier LLM is never told about it), and
+#   - nodes.classify() / nodes.route_query() both key off this same flag.
+# This is safe to turn off: SYSTEM_PROMPT's own emergency/diagnosis rules
+# still apply once a query reaches respond(), so disabling this only removes
+# the deterministic *pre-LLM* routing, not the safety behaviour itself.
+ESCALATE_ROUTING_ENABLED = True
+
+_CLASSIFY_CATEGORIES = """IN_SCOPE     : A direct factual question about a specific Apollo Health Clinic services, doctors availability.
                Examples: "When is the Cardiology department open?", "What is the latest appointment time?",
                "What details do you need for booking an appointment"
- 
-COMPLEX      : A question requiring services comparison, lab report assessment,
-               doctor's expertise, or a recommendation based on the patient's condition.
-               Examples: "Should I take an additional lab test?",
-               "Which lab test would you recommend?",
-               "Which doctor would be best for my condition?"
- 
+
 OUT_OF_SCOPE : A request unrelated to Apollo Health Clinic services.
                Examples: "Write me a poem", "Compare Apollo Health Clinic with another hospital",
-               "What are the special offers today?"
- 
-Reply with exactly one word: SIMPLE, COMPLEX, or OUT_OF_SCOPE. No explanation."""
+               "What are the special offers today?\""""
 
-ESCALATE_RESPONSE = (
-    "That is a great question -- it involves your personal health condition "
-    "and deserves personalised advice.\n\n"
-    "I recommend speaking with an Apollo Health Clinic doctor who can review your "
-    "full case history and recommend the best option for you.\n\n"
-    "Please visit your nearest Apollo Health Clinic branch or call us on 1800-103-1906 "
-    "(toll-free, Monday to Saturday, 9 AM to 6 PM).\n\n"
-    "ClinicalIQ | Apollo Health Clinic"
+# Only appended to the prompt (and offered as a reply option) when
+# ESCALATE_ROUTING_ENABLED is True -- see toggle comment above.
+_ESCALATE_CATEGORY = """
+
+ESCALATE     : The patient describes symptoms, asks for a diagnosis or medication
+               recommendation, or describes what sounds like a medical emergency.
+               Examples: "I have chest pain and can't breathe", "What medicine
+               should I take for my fever?", "I've had a headache for three days,
+               what's wrong with me?", "My child has a high fever, is it serious?\""""
+
+_CLASSIFY_LABELS = (
+    "IN_SCOPE, OUT_OF_SCOPE, or ESCALATE" if ESCALATE_ROUTING_ENABLED
+    else "IN_SCOPE or OUT_OF_SCOPE"
 )
+
+CLASSIFY_SYSTEM_PROMPT = f"""You are a query classifier for ClinicalIQ, the Apollo Health Clinic assistant.
+
+Classify the customer's query into exactly one category:
+
+
+{_CLASSIFY_CATEGORIES}{_ESCALATE_CATEGORY if ESCALATE_ROUTING_ENABLED else ""}
+
+Reply with exactly one word: {_CLASSIFY_LABELS}. No explanation."""
+
+#ESCALATE_RESPONSE = (
+#    "That is a great question -- it involves your personal health condition "
+#    "and deserves personalised advice.\n\n"
+#    "I recommend speaking with an Apollo Health Clinic doctor who can review your "
+#    "full case history and recommend the best option for you.\n\n"
+#    "Please visit your nearest Apollo Health Clinic branch or call us on 1800-103-1906 "
+#    "(toll-free, Monday to Saturday, 9 AM to 6 PM).\n\n"
+#    "ClinicalIQ | Apollo Health Clinic"
+#)
  
 DECLINE_RESPONSE = (
     "I can only help with Apollo Health Clinic services -- appointments, "
@@ -150,5 +202,9 @@ DECLINE_RESPONSE = (
 )
  
 
-DATA_DIR  = Path(__file__).parent.parent.parent / "data"
-CHECKPOINT_DB = DATA_DIR / "checkpoint.db"
+DATA_DIR        = Path(__file__).parent.parent.parent / "data"
+CHECKPOINT_DB   = DATA_DIR / "checkpoints.db"
+VECTORSTORE_DIR          = DATA_DIR / "vectorstore"
+EMBED_MODEL              = "all-MiniLM-L6-v2"
+RETRIEVAL_K              = 2
+RETRIEVAL_SCORE_THRESHOLD = 0.3

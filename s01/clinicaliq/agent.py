@@ -11,17 +11,15 @@ Session 1 graph:
     START --> respond --> END
 """
 import sqlite3
-
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
 from uuid import uuid4
-from .config import CHECKPOINT_DB
 
 from langgraph.graph import END, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
-from .nodes import respond, classify, decline, route_query, escalate
+from .nodes import respond,classify,decline,route_query,escalate,retrieve_docs
 from .state import ClinicalIQState
-
+from .config import CHECKPOINT_DB, ESCALATE_RESPONSE
 
 # ---------------------------------------------------------------------------
 # TODO 5 of 5 -- build_graph
@@ -47,23 +45,25 @@ from .state import ClinicalIQState
 
 def build_graph(checkpointer=None):
     """Build and compile the ClinicalIQ LangGraph graph."""
-     # Start -> Classify -> Respond / Escalate / Decline -> End
+    # START -> Classify -> based on route_query decide next node to be executed.
     builder = StateGraph(ClinicalIQState)
-    builder.add_node("classify", classify)
-    builder.add_node("respond", respond)
-    builder.add_node("escalate", escalate)
+    builder.add_node("classify", classify) #Naming of node
     builder.add_node("decline", decline)
-    
-    builder.set_entry_point("classify") #START
-    builder.add_conditional_edges("classify", route_query,{
-        "respond": "respond",
-        "escalate": "escalate",
-        "decline": "decline"
+    builder.add_node("escalate", escalate)
+    builder.add_node("respond", respond)
+    builder.add_node("retrieve_docs", retrieve_docs)
+
+    builder.set_entry_point("classify") # START
+    builder.add_conditional_edges("classify", route_query, {
+        "retrieve_docs": "retrieve_docs",
+        "decline": "decline",
+        "escalate": "escalate"
     })
-    
-    builder.add_edge("respond", END) # END
-    builder.add_edge("escalate", END) # END
-    builder.add_edge("decline", END) # END
+
+    builder.add_edge("retrieve_docs", "respond")
+    builder.add_edge("respond", END)
+    builder.add_edge("escalate", END)
+    builder.add_edge("decline", END)
 
     return builder.compile(checkpointer=checkpointer)  # optional checkpointer for persistence
 
@@ -78,6 +78,7 @@ graph = build_graph()
 # ---------------------------------------------------------------------------
 
 def run() -> None:
+    import os
     conn = sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False)
     _graph    = build_graph(checkpointer=SqliteSaver(conn))  # terminal app opts into disk persistence explicit
     thread_id = str(uuid4())
@@ -87,6 +88,12 @@ def run() -> None:
     print("  Type 'quit' to exit")
     print("=" * 55)
 
+    print(f"  Session: {thread_id[:8]}...")  # sanity check -- confirms config actually reached graph.invoke()
+    if os.getenv("LANGSMITH_TRACING", "").lower() == "true":
+        project = os.getenv("LANGSMITH_PROJECT", "batch1-wealthdesk")
+        print(f"  Tracing : LangSmith ({project})")
+    print("=" * 55)
+    
     while True:
         try:
             user_input = input("\nYou: ").strip()
@@ -104,9 +111,16 @@ def run() -> None:
         # respond() overwrites it; graph.invoke() returns the full merged state.
         #result = graph.invoke({"customer_message": user_input, "response": ""})
         
-        result = _graph.invoke({"customer_message": user_input, "response": ""}, config=config)
+        result = _graph.invoke({"customer_message": user_input, "response": ""}, config=config,)
         route = result.get("query_type", "?")
+        docs = result.get("retrieved_docs", [])
+        response = result["response"]
         print(f"\n[Routed: {route}]")
+        if docs and response != ESCALATE_RESPONSE:
+            sources = {d.split("]\n")[0].lstrip("[") for d in docs if "]\n" in d}
+            print(f"  [Retrieved {len(docs)} chunk(s) from: {', '.join(sorted(sources))}]")
+        else:
+            print()
         print(f"\nClinicalIQ: {result['response']}")
 
 
