@@ -1,0 +1,16 @@
+# Enforce LF line endings for Python files
+*.py text eol=lf
+
+# Enforce LF for JSON, YAML, Markdown, and text files
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+# Keep binary files untouched
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binarygit

@@ -8,17 +8,90 @@ Each node is a plain Python function:
   - Output: a dict containing ONLY the keys this node changed
              (LangGraph merges it into the state automatically)
 """
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+import re
+import sqlite3
+import unicodedata
+
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langsmith import traceable
 from .config import (
     SYSTEM_PROMPT,CLASSIFY_SYSTEM_PROMPT,ESCALATE_RESPONSE,DECLINE_RESPONSE,
     EMBED_MODEL,VECTORSTORE_DIR, RETRIEVAL_K,RETRIEVAL_SCORE_THRESHOLD,
-    ESCALATE_ROUTING_ENABLED,
+    ESCALATE_ROUTING_ENABLED, COMPLIANCE_BANNED_PHRASES, DB_PATH,
+    SAFE_COMPLIANCE_RESPONSE,
 )
 from .state import ClinicalIQState
-from .tools import llm, classifier_llm
+from .tools import classifier_llm, llm_with_tools, _run_tool
 vectorstore = None  # shared across calls; initialised once by _init_vectorstore()
+
+# ---------------------------------------------------------------------------
+# US-08: Compliance Review Filter
+# ---------------------------------------------------------------------------
+# Compiled regex automaton: one NFA pass over the response text regardless of
+# how many banned phrases are in the list (see config.py for the list itself
+# and the PRD rules it covers).
+_BANNED_PATTERN: re.Pattern = re.compile(
+    "|".join(re.escape(p) for p in COMPLIANCE_BANNED_PHRASES),
+    re.IGNORECASE,
+)
+
+
+def _normalize_for_check(text: str) -> str:
+    # LLMs often output Unicode punctuation that looks identical to ASCII but
+    # breaks substring matching. Replace all Unicode hyphen/dash variants with
+    # an ASCII hyphen so phrases match regardless of which one the LLM used.
+    text = unicodedata.normalize("NFKC", text)
+    for ch in "‐‑‒–—―−":  # hyphen variants + minus sign
+        text = text.replace(ch, "-")
+    return text.lower()
+
+
+def _extract_prices(text: str) -> list:
+    """Extract all 'Rs. X' / 'Rs X' amounts from text as floats."""
+    matches = re.findall(r"rs\.?\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
+    return [float(m) for m in matches]
+
+
+def _load_valid_prices() -> set:
+    # Reads SQLite directly (not via the MCP server) -- the compliance check
+    # needs every valid consultation fee / service / package price as a set
+    # of numbers for comparison, not the MCP tools' formatted display strings.
+    try:
+        conn     = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        fees     = conn.execute("SELECT consultation_fee FROM doctors").fetchall()
+        services = conn.execute("SELECT price FROM services").fetchall()
+        packages = conn.execute("SELECT price FROM health_packages").fetchall()
+        conn.close()
+        return {row[0] for row in fees + services + packages}
+    except Exception:
+        return set()
+
+
+@traceable(name="apollo_compliance_check")
+def _check_compliance(draft: str) -> tuple:
+    """Checks the LLM draft response for:
+      a) banned diagnosis / medication / outcome-promise phrases (PRD rules 1, 2, 5)
+      b) a quoted Rs. amount that isn't a real fee/price in clinic_data.db
+
+    Returns (True, "PASS") if both checks pass, else (False, "<reason>").
+    """
+    normalized = _normalize_for_check(draft)
+
+    match = _BANNED_PATTERN.search(normalized)
+    if match:
+        return False, f"banned phrase: '{match.group()}'"
+
+    mentioned_prices = _extract_prices(normalized)
+    if mentioned_prices:
+        valid_prices = _load_valid_prices()
+        if valid_prices:
+            for price in mentioned_prices:
+                if price not in valid_prices:
+                    return False, f"hallucinated price: Rs. {price:g} not in database"
+
+    return True, "PASS"
 
 #BLOCKLIST = [
 #    "ignore all previous",
@@ -124,24 +197,28 @@ def retrieve_docs(state: ClinicalIQState) -> dict:
 
 
 def respond(state: ClinicalIQState) -> dict:
-    """Call the LLM and return the agent's reply."""
+    """Call the LLM (with MCP tools bound) and return the agent's reply.
+
+    retrieved_docs is now one of two grounding sources, not the only one --
+    doctor availability/pricing questions are grounded via query_doctor/
+    query_service (see tools.py) instead of ChromaDB, so an empty
+    retrieved_docs no longer forces escalation; it just means no policy
+    document context is injected for this turn.
+    """
     history = state.get("history",[])
     retrieved = state.get("retrieved_docs", [])
-   
-    if not retrieved:
-        new_history = history + [
-            {"role": "user",      "content": state["customer_message"]},
-            {"role": "assistant", "content": ESCALATE_RESPONSE},
-        ]
-        return {"response": ESCALATE_RESPONSE, "history": new_history}
- 
-    context_block  = "\n\n---\n\n".join(retrieved)
-    system_content = (
-        SYSTEM_PROMPT
-        + "\n\nThe following sections from Apollo Health Clinic's policy documents "
-        "are relevant to the customer's question. Use this information in your answer:\n\n"
-        + context_block
-    )
+
+    if retrieved:
+        context_block  = "\n\n---\n\n".join(retrieved)
+        system_content = (
+            SYSTEM_PROMPT
+            + "\n\nThe following sections from Apollo Health Clinic's policy documents "
+            "are relevant to the customer's question. Use this information in your answer:\n\n"
+            + context_block
+        )
+    else:
+        system_content = SYSTEM_PROMPT
+
     messages = [
         SystemMessage(content=system_content)
     ]
@@ -151,18 +228,56 @@ def respond(state: ClinicalIQState) -> dict:
        else:
           messages.append(AIMessage(content=turn["content"]))
     messages.append(HumanMessage(content=state["customer_message"]))
+
     try:
-      result = llm.invoke(messages)
-      response_text = result.content
+        result = llm_with_tools.invoke(messages)
+
+        if result.invalid_tool_calls:
+            for itc in result.invalid_tool_calls:
+                print(f"[ClinicalIQ] Invalid tool call ignored: {itc.get('name', 'unknown')} -- {itc.get('error', 'parse error')}")
+
+        # Manual tool-calling loop: the MCP tools (query_doctor, query_service)
+        # are bound to the LLM but run here, not inside LangGraph, so each
+        # result can be logged and fed back as a ToolMessage before asking the
+        # LLM for its next step.
+        max_tool_rounds = 5
+        tool_rounds     = 0
+        while result.tool_calls and tool_rounds < max_tool_rounds:
+            messages.append(result)
+            for tc in result.tool_calls:
+                tool_output = _run_tool(tc["name"], tc["args"])
+                print(f"[ClinicalIQ] MCP tool: {tc['name']}({tc['args']}) -> {str(tool_output)[:80]}")
+                messages.append(ToolMessage(content=str(tool_output), tool_call_id=tc["id"]))
+            tool_rounds += 1
+            result = llm_with_tools.invoke(messages)
+
+        response_text = result.content or ""
     except Exception as e:
         print(f"[ClinicalIQ] LLM error: {e}")
         return {"response": "I am temporarily unavailable. Please try again in a moment."}
- 
+
     new_history = history + [{"role": "user", "content": state["customer_message"]}, {"role": "assistant", "content": response_text}]
     return {"response": response_text, "history": new_history}
-# evntually state will contain multiple fields , maybe history? Query type , information about retrieved docs ,
-# Compliance passed or not?  
-  
+
+
+def check_compliance(state: ClinicalIQState) -> dict:
+    """Post-hoc guardrail on respond()'s draft (US-08). Runs after respond(),
+    before the graph ends -- escalate()/decline() return static, pre-approved
+    strings and skip this node entirely (see agent.py's graph wiring)."""
+    draft          = state["response"]
+    passed, reason = _check_compliance(draft)
+
+    if not passed:
+        print(f"[ClinicalIQ] Compliance FAIL: {reason}")
+        return {
+            "response":          SAFE_COMPLIANCE_RESPONSE,
+            "compliance_status": f"FAIL: {reason}",
+        }
+
+    print("[ClinicalIQ] Compliance PASS")
+    return {"compliance_status": "PASS"}
+
+
 def escalate(state: ClinicalIQState) -> dict:
     new_history = state.get("history", []) + [
         {"role": "user",      "content": state["customer_message"]},

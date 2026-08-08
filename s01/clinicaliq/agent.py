@@ -17,9 +17,9 @@ from langgraph.graph import END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from .nodes import respond,classify,decline,route_query,escalate,retrieve_docs
+from .nodes import respond,classify,decline,route_query,escalate,retrieve_docs,check_compliance
 from .state import ClinicalIQState
-from .config import CHECKPOINT_DB, ESCALATE_RESPONSE
+from .config import CHECKPOINT_DB, ESCALATE_RESPONSE, MCP_SERVER_PATH
 
 # ---------------------------------------------------------------------------
 # TODO 5 of 5 -- build_graph
@@ -52,6 +52,7 @@ def build_graph(checkpointer=None):
     builder.add_node("escalate", escalate)
     builder.add_node("respond", respond)
     builder.add_node("retrieve_docs", retrieve_docs)
+    builder.add_node("check_compliance", check_compliance)  # US-08: post-hoc guardrail on respond()'s draft
 
     builder.set_entry_point("classify") # START
     builder.add_conditional_edges("classify", route_query, {
@@ -61,7 +62,9 @@ def build_graph(checkpointer=None):
     })
 
     builder.add_edge("retrieve_docs", "respond")
-    builder.add_edge("respond", END)
+    builder.add_edge("respond", "check_compliance")
+    builder.add_edge("check_compliance", END)
+    # escalate/decline return static, pre-approved strings -- skip the compliance check
     builder.add_edge("escalate", END)
     builder.add_edge("decline", END)
 
@@ -83,8 +86,13 @@ def run() -> None:
     _graph    = build_graph(checkpointer=SqliteSaver(conn))  # terminal app opts into disk persistence explicit
     thread_id = str(uuid4())
     config    = {"configurable": {"thread_id": thread_id}}
+
+    if not MCP_SERVER_PATH.exists():
+        print(f"[ClinicalIQ] WARNING: MCP server not found at {MCP_SERVER_PATH}")
+
     print("=" * 55)
     print("  ClinicalIQ | Apollo Health Clinic")
+    print("  Tools  : via MCP (s01/mcp_server.py)")
     print("  Type 'quit' to exit")
     print("=" * 55)
 
@@ -111,16 +119,21 @@ def run() -> None:
         # respond() overwrites it; graph.invoke() returns the full merged state.
         #result = graph.invoke({"customer_message": user_input, "response": ""})
         
-        result = _graph.invoke({"customer_message": user_input, "response": ""}, config=config,)
-        route = result.get("query_type", "?")
-        docs = result.get("retrieved_docs", [])
-        response = result["response"]
-        print(f"\n[Routed: {route}]")
+        result = _graph.invoke(
+            {"customer_message": user_input, "response": "", "compliance_status": ""},
+            config=config,
+        )
+        route      = result.get("query_type", "?")
+        docs       = result.get("retrieved_docs", [])
+        compliance = result.get("compliance_status", "")
+        response   = result["response"]
+        print(f"\n[Routed: {route}]", end="")
         if docs and response != ESCALATE_RESPONSE:
             sources = {d.split("]\n")[0].lstrip("[") for d in docs if "]\n" in d}
-            print(f"  [Retrieved {len(docs)} chunk(s) from: {', '.join(sorted(sources))}]")
-        else:
-            print()
+            print(f"  [Retrieved {len(docs)} chunk(s) from: {', '.join(sorted(sources))}]", end="")
+        if compliance:
+            print(f"  [Compliance: {compliance}]", end="")
+        print()
         print(f"\nClinicalIQ: {result['response']}")
 
 

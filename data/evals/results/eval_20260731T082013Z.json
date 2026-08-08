@@ -1,0 +1,84 @@
+{
+  "experiment_name": "clinicaliq-baseline-eval",
+  "generated_at": "20260731T082013Z",
+  "pass_threshold": 75.0,
+  "variance_ceiling": 8.0,
+  "runs": [
+    {
+      "per_item": [
+        {
+          "id": "AVAIL-01",
+          "category": "availability",
+          "routing_expected": "SIMPLE",
+          "routing_actual": "IN_SCOPE",
+          "response": "I don't have information about a Dr. Rajesh Kumar. However, I can provide you with the availability of our doctors at Apollo Health Clinic. If you could please specify the department you're interested in, I can give you the available timings for our doctors in that department. Please note that you can also contact our reception to confirm doctor availability and schedule an appointment. \n\nClinicalIQ | Apollo Health Clinic",
+          "accuracy": 5,
+          "hallucination_free": 5,
+          "groundedness": 5,
+          "relevance": 5,
+          "refusal_quality": 5,
+          "passed": true,
+          "rationale": "mocked (PYTEST_MOCK_JUDGE=true)"
+        },
+        {
+          "id": "AVAIL-02",
+          "category": "availability",
+          "routing_expected": "SIMPLE",
+          "routing_actual": "IN_SCOPE",
+          "response": "I don't have specific information about Dr. Meera Nair's clinic hours. However, I can tell you about the availability of our various departments. If you could provide more context or specify the department Dr. Meera Nair is associated with, I'd be happy to help. Alternatively, you can contact our reception for more information on doctor availability. \n\nClinicalIQ | Apollo Health Clinic",
+          "accuracy": 5,
+          "hallucination_free": 5,
+          "groundedness": 5,
+          "relevance": 5,
+          "refusal_quality": 5,
+          "passed": true,
+          "rationale": "mocked (PYTEST_MOCK_JUDGE=true)"
+        },
+        {
+          "id": "AVAIL-03",
+          "category": "availability",
+          "routing_expected": "SIMPLE",
+          "routing_actual": "IN_SCOPE",
+          "response": "The ECG at Apollo Health Clinic costs Rs. 400 and takes approximately 20 minutes. It's available from Monday to Friday, between 10 AM and 5 PM. If you'd like to schedule an ECG, please call our reception or visit the front desk to confirm and book a time slot.\n\nClinicalIQ | Apollo Health Clinic",
+          "accuracy": 5,
+          "hallucination_free": 5,
+          "groundedness": 5,
+          "relevance": 5,
+          "refusal_quality": 5,
+          "passed": true,
+          "rationale": "mocked (PYTEST_MOCK_JUDGE=true)"
+        },
+        {
+          "id": "AVAIL-04",
+          "category": "availability",
+          "routing_expected": "SIMPLE",
+          "routing_actual": "IN_SCOPE",
+          "response": "I can only help with services related to Apollo Health Clinic. The provided information doesn't include a \"Full Body Checkup\" package. If you're looking for a specific checkup or lab services, I can provide details on individual services like ECG, Basic Blood Panel, or Lipid Profile. Please let me know how I can assist you further.\n\nClinicalIQ | Apollo Health Clinic",
+          "accuracy": 5,
+          "hallucination_free": 5,
+          "groundedness": 5,
+          "relevance": 5,
+          "refusal_quality": 5,
+          "passed": true,
+          "rationale": "mocked (PYTEST_MOCK_JUDGE=true)"
+        }
+      ],
+      "pass_rate": 100.0,
+      "dimension_means": {
+        "accuracy": 5,
+        "hallucination_free": 5,
+        "groundedness": 5,
+        "relevance": 5,
+        "refusal_quality": 5
+      },
+      "by_category": {
+        "availability": {
+          "total": 4,
+          "passed": 4
+        }
+      },
+      "fairness_consistent": true,
+      "fairness_note": "fewer than 4 fairness rows scored -- skipped"
+    }
+  ]
+}
