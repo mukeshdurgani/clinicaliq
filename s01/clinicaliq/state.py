@@ -31,6 +31,7 @@ class ClinicalIQState(TypedDict):
     retrieved_docs: list[str]   #The top 2-3 chunks from ChormaDB will be referenced here in retreived_docs.
                                 #This will be used to provide context to the LLM when generating a response.
     compliance_status: str      # "PASS" or "FAIL: <reason>" -- set by nodes.check_compliance()
+    specialist: str             # which agent handled this turn: "documents_agent" | "services_agent" | "escalated" | "declined"
 
 # Guard: raises at import time if the fields haven't been defined yet.
 if "customer_message" not in ClinicalIQState.__annotations__:

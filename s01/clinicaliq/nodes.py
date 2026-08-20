@@ -15,20 +15,26 @@ import unicodedata
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langgraph.graph import END, StateGraph
 from langsmith import traceable
 from .config import (
-    SYSTEM_PROMPT,CLASSIFY_SYSTEM_PROMPT,ESCALATE_RESPONSE,DECLINE_RESPONSE,
+    SYSTEM_PROMPT,DOCS_SYSTEM_PROMPT,CLASSIFY_SYSTEM_PROMPT,ESCALATE_RESPONSE,DECLINE_RESPONSE,
     EMBED_MODEL,VECTORSTORE_DIR, RETRIEVAL_K,RETRIEVAL_SCORE_THRESHOLD,
     ESCALATE_ROUTING_ENABLED, COMPLIANCE_BANNED_PHRASES, DB_PATH,
     SAFE_COMPLIANCE_RESPONSE,
 )
 from .state import ClinicalIQState
-from .tools import classifier_llm, llm_with_tools, _run_tool
+from .tools import classifier_llm, llm, llm_with_tools, _run_tool
 vectorstore = None  # shared across calls; initialised once by _init_vectorstore()
 
 # ---------------------------------------------------------------------------
-# US-08: Compliance Review Filter
+# US-08: Compliance Review Filter -- Compliance Agent (critique-revise loop)
 # ---------------------------------------------------------------------------
+# check_compliance() flags a violation; revise_response() then asks the LLM to
+# rewrite just the flagged violation instead of hard-replacing the whole draft
+# with SAFE_COMPLIANCE_RESPONSE (see call_compliance_agent()/create_compliance_agent()
+# further down -- mirrors WealthDesk's s12 Compliance Agent).
+#
 # Compiled regex automaton: one NFA pass over the response text regardless of
 # how many banned phrases are in the list (see config.py for the list itself
 # and the PRD rules it covers).
@@ -139,14 +145,16 @@ def _init_vectorstore() -> None:
  
  
 def classify(state: ClinicalIQState) -> dict:
-    """Call the LLM and return the agent's reply."""
-    valid_types = {"IN_SCOPE", "OUT_OF_SCOPE"}
+    """Supervisor node: classify the query into SERVICES / POLICY / OUT_OF_SCOPE
+    (+ ESCALATE, see toggle below) so route_supervisor() can send it to the
+    right specialist agent."""
+    valid_types = {"SERVICES", "POLICY", "OUT_OF_SCOPE"}
     # --- ESCALATE routing toggle -------------------------------------------
     # See ESCALATE_ROUTING_ENABLED in config.py. When False, CLASSIFY_SYSTEM_PROMPT
     # never mentions ESCALATE, but as a belt-and-braces measure this also stops
     # a stray "ESCALATE" reply from the LLM being accepted -- it would fall
     # through to the `query_type not in valid_types` check below and reset to
-    # IN_SCOPE, same as any other unrecognised reply.
+    # POLICY, same as any other unrecognised reply.
     if ESCALATE_ROUTING_ENABLED:
         valid_types.add("ESCALATE")
     # -------------------------------------------------------------------------
@@ -160,11 +168,14 @@ def classify(state: ClinicalIQState) -> dict:
        result = classifier_llm.invoke(messages)
        query_type = result.content.strip().upper()
        if query_type not in valid_types:
-          query_type = "IN_SCOPE"
+          # Fall back to POLICY (not SERVICES) on a misclassification -- it
+          # never triggers a live tool call, so a bad reply degrades to an
+          # unnecessary ChromaDB lookup rather than an unnecessary DB write path.
+          query_type = "POLICY"
     except Exception as e:
         print(f"[ClinicalIQ] Classification error: {e}")
-        query_type = "IN_SCOPE"
- 
+        query_type = "POLICY"
+
     return {"query_type": query_type, "retrieved_docs": []}
 
 def retrieve_docs(state: ClinicalIQState) -> dict:
@@ -196,37 +207,63 @@ def retrieve_docs(state: ClinicalIQState) -> dict:
     return {"retrieved_docs": retrieved}
 
 
-def respond(state: ClinicalIQState) -> dict:
-    """Call the LLM (with MCP tools bound) and return the agent's reply.
+# ---------------------------------------------------------------------------
+# US-11: Documents Agent + Services Agent (specialist subgraphs)
+# ---------------------------------------------------------------------------
+# Mirrors WealthDesk's s10 supervisor pattern: classify() routes to one of two
+# independently-compiled subgraphs instead of a single respond() node that did
+# both RAG context injection and tool-calling. The Documents Agent only ever
+# sees ChromaDB context (no MCP tools bound -- see DOCS_SYSTEM_PROMPT comment
+# in config.py). The Services Agent only ever calls MCP tools (no ChromaDB
+# context -- doctor/service data is live and must come from query_doctor/
+# query_service, never from retrieved policy chunks).
 
-    retrieved_docs is now one of two grounding sources, not the only one --
-    doctor availability/pricing questions are grounded via query_doctor/
-    query_service (see tools.py) instead of ChromaDB, so an empty
-    retrieved_docs no longer forces escalation; it just means no policy
-    document context is injected for this turn.
-    """
-    history = state.get("history",[])
+def _doc_respond(state: ClinicalIQState) -> dict:
+    """Documents Agent's respond step: ChromaDB context + plain LLM, no tools."""
+    history   = state.get("history", [])
     retrieved = state.get("retrieved_docs", [])
 
     if retrieved:
         context_block  = "\n\n---\n\n".join(retrieved)
         system_content = (
-            SYSTEM_PROMPT
+            DOCS_SYSTEM_PROMPT
             + "\n\nThe following sections from Apollo Health Clinic's policy documents "
             "are relevant to the customer's question. Use this information in your answer:\n\n"
             + context_block
         )
     else:
-        system_content = SYSTEM_PROMPT
+        system_content = DOCS_SYSTEM_PROMPT
 
-    messages = [
-        SystemMessage(content=system_content)
-    ]
+    messages = [SystemMessage(content=system_content)]
     for turn in history:
-       if turn["role"] == "user":
-          messages.append(HumanMessage(content=turn["content"]))
-       else:
-          messages.append(AIMessage(content=turn["content"]))
+        if turn["role"] == "user":
+            messages.append(HumanMessage(content=turn["content"]))
+        else:
+            messages.append(AIMessage(content=turn["content"]))
+    messages.append(HumanMessage(content=state["customer_message"]))
+
+    try:
+        result        = llm.invoke(messages)
+        response_text = result.content or ""
+    except Exception as e:
+        print(f"[ClinicalIQ] Documents Agent LLM error: {e}")
+        response_text = "I am temporarily unavailable. Please try again in a moment."
+
+    new_history = history + [{"role": "user", "content": state["customer_message"]}, {"role": "assistant", "content": response_text}]
+    return {"response": response_text, "history": new_history}
+
+
+def _services_respond(state: ClinicalIQState) -> dict:
+    """Services Agent's respond step: MCP tools (query_doctor/query_service),
+    no ChromaDB context. Same multi-round tool-calling loop the old respond()
+    used, unchanged."""
+    history  = state.get("history", [])
+    messages = [SystemMessage(content=SYSTEM_PROMPT)]
+    for turn in history:
+        if turn["role"] == "user":
+            messages.append(HumanMessage(content=turn["content"]))
+        else:
+            messages.append(AIMessage(content=turn["content"]))
     messages.append(HumanMessage(content=state["customer_message"]))
 
     try:
@@ -253,29 +290,174 @@ def respond(state: ClinicalIQState) -> dict:
 
         response_text = result.content or ""
     except Exception as e:
-        print(f"[ClinicalIQ] LLM error: {e}")
-        return {"response": "I am temporarily unavailable. Please try again in a moment."}
+        print(f"[ClinicalIQ] Services Agent LLM error: {e}")
+        response_text = "I am temporarily unavailable. Please try again in a moment."
 
     new_history = history + [{"role": "user", "content": state["customer_message"]}, {"role": "assistant", "content": response_text}]
     return {"response": response_text, "history": new_history}
 
 
+def create_documents_agent():
+    """Compile the Documents Agent as a standalone subgraph: retrieve_docs -> respond -> END."""
+    builder = StateGraph(ClinicalIQState)
+    builder.add_node("retrieve_docs", retrieve_docs)
+    builder.add_node("document_respond", _doc_respond)
+    builder.set_entry_point("retrieve_docs")
+    builder.add_edge("retrieve_docs", "document_respond")
+    builder.add_edge("document_respond", END)
+    return builder.compile()
+
+
+def create_services_agent():
+    """Compile the Services Agent as a standalone subgraph: respond -> END (tool
+    calls happen inside _services_respond, not as separate graph nodes)."""
+    builder = StateGraph(ClinicalIQState)
+    builder.add_node("services_respond", _services_respond)
+    builder.set_entry_point("services_respond")
+    builder.add_edge("services_respond", END)
+    return builder.compile()
+
+
+_documents_agent = create_documents_agent()
+_services_agent  = create_services_agent()
+
+
+def call_documents_agent(state: ClinicalIQState) -> dict:
+    """Supervisor node that invokes the Documents Agent subgraph and merges
+    its result back into supervisor state."""
+    print("[ClinicalIQ] Supervisor -> Documents Agent")
+    result = _documents_agent.invoke({
+        "customer_message":  state["customer_message"],
+        "history":           state.get("history", []),
+        "response":          "",
+        "query_type":        state.get("query_type", "POLICY"),
+        "retrieved_docs":    [],
+        "compliance_status": "",
+        "specialist":        "",
+    })
+    return {
+        "response":       result["response"],
+        "retrieved_docs": result.get("retrieved_docs", []),
+        "history":        result.get("history", state.get("history", [])),
+        "specialist":     "documents_agent",
+    }
+
+
+def call_services_agent(state: ClinicalIQState) -> dict:
+    """Supervisor node that invokes the Services Agent subgraph and merges
+    its result back into supervisor state."""
+    print("[ClinicalIQ] Supervisor -> Services Agent")
+    result = _services_agent.invoke({
+        "customer_message":  state["customer_message"],
+        "history":           state.get("history", []),
+        "response":          "",
+        "query_type":        state.get("query_type", "SERVICES"),
+        "retrieved_docs":    [],
+        "compliance_status": "",
+        "specialist":        "",
+    })
+    return {
+        "response":   result["response"],
+        "history":    result.get("history", state.get("history", [])),
+        "specialist": "services_agent",
+    }
+
+
 def check_compliance(state: ClinicalIQState) -> dict:
-    """Post-hoc guardrail on respond()'s draft (US-08). Runs after respond(),
-    before the graph ends -- escalate()/decline() return static, pre-approved
-    strings and skip this node entirely (see agent.py's graph wiring)."""
+    """Compliance Agent's first node (US-08): runs _check_compliance() on the
+    draft returned by either specialist agent and sets compliance_status only.
+    Does NOT overwrite the response on FAIL -- revise_response() rewrites the
+    flagged violation instead of hard-replacing it with a generic message."""
     draft          = state["response"]
     passed, reason = _check_compliance(draft)
 
     if not passed:
         print(f"[ClinicalIQ] Compliance FAIL: {reason}")
-        return {
-            "response":          SAFE_COMPLIANCE_RESPONSE,
-            "compliance_status": f"FAIL: {reason}",
-        }
+        return {"compliance_status": f"FAIL: {reason}"}
 
     print("[ClinicalIQ] Compliance PASS")
     return {"compliance_status": "PASS"}
+
+
+def revise_response(state: ClinicalIQState) -> dict:
+    """Compliance Agent's second node: instead of hard-replacing a failing
+    draft with SAFE_COMPLIANCE_RESPONSE, ask the LLM to rewrite just the
+    flagged violation while keeping the rest of the response helpful."""
+    draft  = state["response"]
+    reason = state.get("compliance_status", "violation").replace("FAIL: ", "")
+
+    prompt = (
+        "You are an Apollo Health Clinic compliance officer reviewing an AI "
+        "patient-guidance response.\n\n"
+        f"The response was flagged for: {reason}\n\n"
+        "Rewrite it to fix the violation while keeping the response helpful.\n\n"
+        "Rules:\n"
+        "  1. Never diagnose a condition, name or recommend a medication, or "
+        "promise a treatment outcome (e.g. 'guaranteed to cure', '100% effective')\n"
+        "  2. Only state Rs. amounts that appeared in the original -- do not add new ones\n"
+        "  3. Keep the rewritten response under 150 words\n"
+        "  4. End with 'ClinicalIQ | Apollo Health Clinic'\n\n"
+        f"Original response:\n{draft}\n\n"
+        "Compliant rewrite:"
+    )
+
+    try:
+        result       = llm.invoke([HumanMessage(content=prompt)])
+        revised_text = result.content.strip() or SAFE_COMPLIANCE_RESPONSE
+    except Exception as e:
+        print(f"[ClinicalIQ] Compliance Agent revision error: {e}")
+        revised_text = SAFE_COMPLIANCE_RESPONSE
+
+    print("[ClinicalIQ] Compliance Agent: response revised")
+    return {
+        "response":          revised_text,
+        "compliance_status": "REVISED",
+    }
+
+
+def route_compliance(state: ClinicalIQState) -> str:
+    """Route to revise if check_compliance flagged a violation."""
+    return "revise" if state.get("compliance_status", "").startswith("FAIL") else END
+
+
+def create_compliance_agent():
+    """Compile the Compliance Agent as a standalone subgraph:
+    check_compliance -> (revise -> END) | END."""
+    builder = StateGraph(ClinicalIQState)
+    builder.add_node("check_compliance", check_compliance)
+    builder.add_node("revise",           revise_response)
+    builder.set_entry_point("check_compliance")
+    builder.add_conditional_edges(
+        "check_compliance",
+        route_compliance,
+        {"revise": "revise", END: END},
+    )
+    builder.add_edge("revise", END)
+    return builder.compile()
+
+
+_compliance_agent = create_compliance_agent()
+
+
+def call_compliance_agent(state: ClinicalIQState) -> dict:
+    """Supervisor node that invokes the Compliance Agent subgraph on the
+    specialist's draft response, before the graph ends -- escalate()/decline()
+    return static, pre-approved strings and skip this node entirely (see
+    agent.py's graph wiring)."""
+    print("[ClinicalIQ] Supervisor -> Compliance Agent")
+    result = _compliance_agent.invoke({
+        "customer_message":  state["customer_message"],
+        "response":          state["response"],
+        "history":           state.get("history", []),
+        "query_type":        state.get("query_type", ""),
+        "retrieved_docs":    state.get("retrieved_docs", []),
+        "specialist":        state.get("specialist", ""),
+        "compliance_status": "",
+    })
+    return {
+        "response":          result["response"],
+        "compliance_status": result.get("compliance_status", "PASS"),
+    }
 
 
 def escalate(state: ClinicalIQState) -> dict:
@@ -283,17 +465,19 @@ def escalate(state: ClinicalIQState) -> dict:
         {"role": "user",      "content": state["customer_message"]},
         {"role": "assistant", "content": ESCALATE_RESPONSE},
     ]
-    return {"response": ESCALATE_RESPONSE, "history": new_history}
- 
+    return {"response": ESCALATE_RESPONSE, "history": new_history, "specialist": "escalated"}
+
 def decline(state: ClinicalIQState) -> dict:
     new_history = state.get("history", []) + [
         {"role": "user",      "content": state["customer_message"]},
         {"role": "assistant", "content": DECLINE_RESPONSE},
     ]
-    return {"response": DECLINE_RESPONSE, "history": new_history}
- 
-def route_query(state: ClinicalIQState)->str:
-   query_type = state.get("query_type","SIMPLE")
+    return {"response": DECLINE_RESPONSE, "history": new_history, "specialist": "declined"}
+
+def route_supervisor(state: ClinicalIQState) -> str:
+   """Supervisor routing function: sends the classified query to the right
+   specialist agent (or escalate/decline)."""
+   query_type = state.get("query_type", "POLICY")
    # --- ESCALATE routing toggle --------------------------------------------
    # See ESCALATE_ROUTING_ENABLED in config.py / classify() above. Turning the
    # toggle off means classify() can never produce "ESCALATE", which makes this
@@ -303,15 +487,6 @@ def route_query(state: ClinicalIQState)->str:
    # -------------------------------------------------------------------------
    if query_type == "OUT_OF_SCOPE":
       return "decline"
-   return "retrieve_docs"
-    
-    
-    
-    #try:
-    #    result = llm.invoke(messages)
-    #    return {"response": result.content}
-    #except Exception as exc:
-    #    print(f"[ClinicalIQ] LLM call failed: {exc}")
-    #    return {"response": "I am temporarily unavailable. Please try again in a moment."}
-
-    
+   if query_type == "SERVICES":
+      return "call_services_agent"
+   return "call_documents_agent"
