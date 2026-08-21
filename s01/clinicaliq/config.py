@@ -184,6 +184,69 @@ Sign off every response as: ClinicalIQ | Apollo Health Clinic
 # removes the deterministic *pre-LLM* routing, not the safety behaviour itself.
 ESCALATE_ROUTING_ENABLED = True
 
+# ---------------------------------------------------------------------------
+# Deterministic ESCALATE pre-filter (safety net for nodes.classify())
+# ---------------------------------------------------------------------------
+# The classifier LLM is not 100% reliable at catching symptom / medication /
+# emergency phrasing -- observed a real miss on "What medicine should I take
+# for my fever?" during manual testing, where the classifier returned SERVICES
+# instead of ESCALATE and the query reached a specialist agent's LLM instead of
+# the static, pre-approved ESCALATE_RESPONSE. Since ESCALATE is the
+# safety-critical route, nodes.classify() checks these regex patterns FIRST
+# and force-routes to ESCALATE on a match, without ever calling the classifier
+# LLM for that turn -- one less point of LLM unreliability on the path that
+# matters most.
+#
+# Deliberately narrow / high-precision: a false negative here just falls
+# through to the classifier LLM (today's behaviour, unchanged); a false
+# positive escalates a query that didn't strictly need it, which is the safe
+# direction to err in for a patient-facing medical assistant. Only covers the
+# ESCALATE example phrasing from CLASSIFY_SYSTEM_PROMPT below -- it is not
+# meant to catch every possible symptom/medication query, just the obvious,
+# high-confidence ones.
+ESCALATE_KEYWORD_PATTERNS = [
+    r"\bchest pain\b",
+    r"\b(can'?t|cannot|difficulty)\s+breath(e|ing)\b",
+    r"\bnot breathing\b",
+    r"\bsevere bleeding\b",
+    r"\b(lost|loss of)\s+consciousness\b",
+    r"\bunconscious\b",
+    r"\bwhat medicine\b",
+    r"\bwhat medication\b",
+    r"\b(should|can)\s+i\s+take\b.*\bfor\b",
+    r"\bwhat'?s wrong with (me|him|her)\b",
+    r"\bis (it|this|that) serious\b",
+    r"\bdo i have\b",
+    r"\bam i (suffering|sick)\s+(from|with)\b",
+]
+
+# ---------------------------------------------------------------------------
+# classify() input guardrails (prompt-injection blocklist + length limits)
+# ---------------------------------------------------------------------------
+# Ported from WealthDesk's s03 nodes.py, where this is a "Provided" defensive
+# guardrail (not part of that session's routing exercise): cheap string checks
+# that run BEFORE the classifier LLM is ever called, so obvious prompt-
+# injection attempts and pathological input lengths are rejected without
+# spending an API call or trusting the LLM to police its own system prompt.
+# This exact phrase list existed in ClinicalIQ's nodes.py too, but only as a
+# dead, commented-out `#BLOCKLIST = [...]` block left over from that port --
+# never wired into classify(). See nodes.classify() for where it's applied.
+PROMPT_INJECTION_BLOCKLIST = [
+    "ignore all previous",
+    "forget everything",
+    "you are now",
+    "disregard your system",
+    "act as",
+    "jailbreak",
+]
+
+# Same rationale as WealthDesk's s03 length check: reject empty/near-empty
+# input (nothing to classify) and pathologically long input (e.g. a huge
+# pasted block trying to bury an injection attempt) before the classifier
+# LLM call.
+MIN_QUERY_LENGTH = 3
+MAX_QUERY_LENGTH = 500
+
 # US-11: two specialist categories replace the old single IN_SCOPE bucket --
 # SERVICES needs the live doctor/service database (query_doctor/query_service
 # via MCP), POLICY needs the ChromaDB policy documents. See nodes.py's

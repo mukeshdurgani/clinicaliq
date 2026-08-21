@@ -11,6 +11,7 @@ Each node is a plain Python function:
 import re
 import sqlite3
 import unicodedata
+from typing import Callable, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -20,11 +21,21 @@ from langsmith import traceable
 from .config import (
     SYSTEM_PROMPT,DOCS_SYSTEM_PROMPT,CLASSIFY_SYSTEM_PROMPT,ESCALATE_RESPONSE,DECLINE_RESPONSE,
     EMBED_MODEL,VECTORSTORE_DIR, RETRIEVAL_K,RETRIEVAL_SCORE_THRESHOLD,
-    ESCALATE_ROUTING_ENABLED, COMPLIANCE_BANNED_PHRASES, DB_PATH,
-    SAFE_COMPLIANCE_RESPONSE,
+    ESCALATE_ROUTING_ENABLED, ESCALATE_KEYWORD_PATTERNS, COMPLIANCE_BANNED_PHRASES, DB_PATH,
+    SAFE_COMPLIANCE_RESPONSE, PROMPT_INJECTION_BLOCKLIST, MIN_QUERY_LENGTH, MAX_QUERY_LENGTH,
 )
 from .state import ClinicalIQState
 from .tools import classifier_llm, llm, llm_with_tools, _run_tool
+
+# ---------------------------------------------------------------------------
+# Streamlit UI: token streaming hook (ported from WealthDesk's s13 nodes.py)
+#
+# Set by app.py to a callable before graph.invoke() when the Streamlit UI
+# wants to display tokens as they arrive. None = silent (tests, CLI) --
+# _doc_respond() and _services_respond() fall back to llm.invoke() in that case.
+# ---------------------------------------------------------------------------
+_stream_callback: Optional[Callable[[str], None]] = None
+
 vectorstore = None  # shared across calls; initialised once by _init_vectorstore()
 
 # ---------------------------------------------------------------------------
@@ -41,6 +52,19 @@ vectorstore = None  # shared across calls; initialised once by _init_vectorstore
 _BANNED_PATTERN: re.Pattern = re.compile(
     "|".join(re.escape(p) for p in COMPLIANCE_BANNED_PHRASES),
     re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Deterministic ESCALATE pre-filter -- see ESCALATE_KEYWORD_PATTERNS in
+# config.py for what this catches and why (classifier LLM reliability).
+# Only compiled when the toggle is on: with ESCALATE_ROUTING_ENABLED False,
+# ESCALATE is not a valid classify() outcome at all, so there is nothing for
+# this pattern to route to -- classify() below checks the same flag before
+# ever consulting it.
+# ---------------------------------------------------------------------------
+_ESCALATE_PATTERN: "re.Pattern | None" = (
+    re.compile("|".join(ESCALATE_KEYWORD_PATTERNS), re.IGNORECASE)
+    if ESCALATE_ROUTING_ENABLED else None
 )
 
 
@@ -99,15 +123,6 @@ def _check_compliance(draft: str) -> tuple:
 
     return True, "PASS"
 
-#BLOCKLIST = [
-#    "ignore all previous",
-#    "forget everything",
-#    "you are now",
-#    "disregard your system",
-#    "act as",
-#    "jailbreak",
-#]
-
 # ---------------------------------------------------------------------------
 # TODO 4 of 5 -- respond node
 # ---------------------------------------------------------------------------
@@ -148,6 +163,22 @@ def classify(state: ClinicalIQState) -> dict:
     """Supervisor node: classify the query into SERVICES / POLICY / OUT_OF_SCOPE
     (+ ESCALATE, see toggle below) so route_supervisor() can send it to the
     right specialist agent."""
+    msg = state["customer_message"].strip()
+
+    # --- Input guardrails (ported from WealthDesk's s03 nodes.py) -----------
+    # Cheap string checks before spending an LLM call: reject empty/near-empty
+    # input (nothing to classify) and pathologically long input, and
+    # short-circuit obvious prompt-injection phrasing straight to OUT_OF_SCOPE
+    # rather than trusting the classifier LLM (or a specialist's system
+    # prompt) to police it. Runs first, ahead of even the ESCALATE pre-filter
+    # below -- an injection attempt should never be treated as a genuine
+    # medical query just because it happens to share wording with one.
+    if not msg or len(msg) < MIN_QUERY_LENGTH or len(msg) > MAX_QUERY_LENGTH:
+        return {"query_type": "OUT_OF_SCOPE", "retrieved_docs": []}
+    if any(phrase in msg.lower() for phrase in PROMPT_INJECTION_BLOCKLIST):
+        return {"query_type": "OUT_OF_SCOPE", "retrieved_docs": []}
+    # -------------------------------------------------------------------------
+
     valid_types = {"SERVICES", "POLICY", "OUT_OF_SCOPE"}
     # --- ESCALATE routing toggle -------------------------------------------
     # See ESCALATE_ROUTING_ENABLED in config.py. When False, CLASSIFY_SYSTEM_PROMPT
@@ -157,6 +188,18 @@ def classify(state: ClinicalIQState) -> dict:
     # POLICY, same as any other unrecognised reply.
     if ESCALATE_ROUTING_ENABLED:
         valid_types.add("ESCALATE")
+
+        # --- Deterministic ESCALATE pre-filter ------------------------------
+        # Safety net for classifier LLM misses on obvious emergency/symptom/
+        # medication phrasing (see ESCALATE_KEYWORD_PATTERNS in config.py --
+        # this is what caught "What medicine should I take for my fever?"
+        # slipping through as SERVICES during manual testing). Checked BEFORE
+        # the classifier LLM call, and short-circuits it entirely on a match --
+        # the safety-critical route should not depend on an LLM call at all
+        # when the query is this unambiguous.
+        if _ESCALATE_PATTERN.search(state["customer_message"]):
+            return {"query_type": "ESCALATE", "retrieved_docs": []}
+        # ---------------------------------------------------------------------
     # -------------------------------------------------------------------------
 
     messages = [
@@ -243,8 +286,17 @@ def _doc_respond(state: ClinicalIQState) -> dict:
     messages.append(HumanMessage(content=state["customer_message"]))
 
     try:
-        result        = llm.invoke(messages)
-        response_text = result.content or ""
+        # When the Streamlit UI is active, app.py sets _stream_callback to a
+        # _StreamingState instance before graph.invoke() -- use llm.stream() so
+        # each token can be pushed to the UI placeholder as it arrives.
+        if _stream_callback is not None:
+            response_text = ""
+            for chunk in llm.stream(messages):
+                if chunk.content:
+                    response_text += chunk.content
+                    _stream_callback(chunk.content)
+        else:
+            response_text = llm.invoke(messages).content or ""
     except Exception as e:
         print(f"[ClinicalIQ] Documents Agent LLM error: {e}")
         response_text = "I am temporarily unavailable. Please try again in a moment."
@@ -279,7 +331,9 @@ def _services_respond(state: ClinicalIQState) -> dict:
         # LLM for its next step.
         max_tool_rounds = 5
         tool_rounds     = 0
+        used_tools      = False
         while result.tool_calls and tool_rounds < max_tool_rounds:
+            used_tools = True
             messages.append(result)
             for tc in result.tool_calls:
                 tool_output = _run_tool(tc["name"], tc["args"])
@@ -288,7 +342,22 @@ def _services_respond(state: ClinicalIQState) -> dict:
             tool_rounds += 1
             result = llm_with_tools.invoke(messages)
 
-        response_text = result.content or ""
+        if used_tools:
+            # Tool results are in `messages` now -- generate the final answer
+            # with the plain (non tool-bound) LLM so it can be streamed. Mirrors
+            # WealthDesk's rates agent: always a dedicated post-tool call rather
+            # than reusing the tool-bound decision call's (unstreamed) content.
+            if _stream_callback is not None:
+                response_text = ""
+                for chunk in llm.stream(messages):
+                    if chunk.content:
+                        response_text += chunk.content
+                        _stream_callback(chunk.content)
+            else:
+                response_text = llm.invoke(messages).content or ""
+        else:
+            # Direct response (no tool call) -- already computed, no re-invoke needed.
+            response_text = result.content or ""
     except Exception as e:
         print(f"[ClinicalIQ] Services Agent LLM error: {e}")
         response_text = "I am temporarily unavailable. Please try again in a moment."
