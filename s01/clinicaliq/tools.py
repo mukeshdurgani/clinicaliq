@@ -16,7 +16,8 @@ from langchain_groq import ChatGroq
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from .config import (
-    MAX_TOKENS, MCP_SERVER_PATH, MODEL_NAME, TEMPERATURE, TOOL_MODEL_NAME,
+    LLAMAGUARD_MAX_TOKENS, LLAMAGUARD_MODEL,
+    MAX_TOKENS, MCP_SERVER_PATH, MODEL_NAME, TEMPERATURE,
     classifier_MAX_TOKENS, classifier_TEMPERATURE,
 )
 
@@ -31,7 +32,7 @@ if not GROQ_API_KEY:
 
 llm = ChatGroq(
     api_key=GROQ_API_KEY,
-    model=TOOL_MODEL_NAME,
+    model=MODEL_NAME,
     temperature=TEMPERATURE,
     max_tokens=MAX_TOKENS,
 )
@@ -41,6 +42,15 @@ classifier_llm = ChatGroq(
     model=MODEL_NAME,
     temperature=classifier_TEMPERATURE,
     max_tokens=classifier_MAX_TOKENS,
+    reasoning_effort="low",  # cuts hidden chain-of-thought tokens -- see classifier_MAX_TOKENS comment in config.py
+)
+
+# S14: Llama Prompt Guard 2 -- Layer 2 of the input guard (semantic injection detection).
+llamaguard_llm = ChatGroq(
+    api_key=GROQ_API_KEY,
+    model=LLAMAGUARD_MODEL,
+    temperature=0.0,
+    max_tokens=LLAMAGUARD_MAX_TOKENS,
 )
 
 

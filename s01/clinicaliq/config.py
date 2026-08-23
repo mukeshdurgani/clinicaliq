@@ -11,23 +11,30 @@ Nothing here makes API calls -- it's pure configuration.
 
 from pathlib import Path
 
-# MODEL_NAME  = "meta-llama/llama-4-scout-17b-16e-instruct" (old model deprecated as on 17July2026)
-# MODEL_NAME is used for classify() only now -- see TOOL_MODEL_NAME below.
-MODEL_NAME  = "llama-3.3-70b-versatile"
+# "meta-llama/llama-4-scout-17b-16e-instruct" and "llama-3.3-70b-versatile" are
+# old models, both deprecated by Groq as of 17 July 2026. Switched to
+# openai/gpt-oss-20b, which also happens to produce OpenAI-compatible JSON
+# tool calls (required by Groq) -- llama-3.x models on Groq emitted XML-ish
+# tool-call syntax instead (e.g. "<function=query_doctor {...}</function>")
+# that Groq's API rejected with a 400 tool_use_failed error the moment tools
+# were bound, confirmed when query_doctor/query_service were added in
+# tools.py (US-06 Part 2). Used for both classify() and respond()/llm_with_tools.
+
+MODEL_NAME  = "openai/gpt-oss-20b"
 TEMPERATURE = 0.3
 MAX_TOKENS  = 300
 
+# openai/gpt-oss-20b is a reasoning model -- it spends completion tokens on
+# hidden chain-of-thought (response_metadata['reasoning_content']) before ever
+# writing the classification word to `content`. With max_tokens=10 the model
+# was hitting finish_reason="length" mid-reasoning on every call, so `content`
+# came back "" and classify() silently defaulted to POLICY regardless of the
+# actual query -- confirmed via direct classifier_llm.invoke() testing, where
+# completion_tokens=10 was entirely reasoning tokens. 40 gives enough headroom
+# for reasoning + the one-word answer (see also reasoning_effort="low" on
+# classifier_llm in tools.py, which further reduces reasoning token usage).
 classifier_TEMPERATURE = 0.0
-classifier_MAX_TOKENS  = 10
-
-# openai/gpt-oss-20b produces OpenAI-compatible JSON tool calls (required by Groq).
-# llama-3.x models on Groq emit XML-ish tool-call syntax instead (e.g.
-# "<function=query_doctor {...}</function>") that Groq's API rejects with a 400
-# tool_use_failed error the moment tools are bound -- confirmed when
-# query_doctor/query_service were added in tools.py (US-06 Part 2). respond()
-# uses this model via llm_with_tools; classify() is unaffected and keeps
-# MODEL_NAME since it never calls tools.
-TOOL_MODEL_NAME = "openai/gpt-oss-20b"
+classifier_MAX_TOKENS  = 40
 
 # ---------------------------------------------------------------------------
 # TODO 2 of 5 -- System prompt
@@ -247,6 +254,67 @@ PROMPT_INJECTION_BLOCKLIST = [
 MIN_QUERY_LENGTH = 3
 MAX_QUERY_LENGTH = 500
 
+# ---------------------------------------------------------------------------
+# S14: two-layer input guard (ported from WealthDesk's s14 nodes.py)
+# ---------------------------------------------------------------------------
+# Runs in nodes.guard(), the new graph entry point -- ahead of classify() and
+# its PROMPT_INJECTION_BLOCKLIST check above. The two checks are deliberately
+# layered, not merged: guard() is a cheap, deterministic front door that never
+# calls an LLM for an obvious attack, while classify()'s blocklist remains a
+# second, independent line of defence for anything that slips past regex
+# (case variants, phrasing not covered by INJECTION_PATTERNS, etc.).
+#
+# Layer 1a (regex, PII):        PII_PATTERNS
+# Layer 1b (regex, injection):  INJECTION_PATTERNS
+# Layer 2  (semantic):          Llama Prompt Guard 2 via Groq (see tools.py)
+
+# S14: Llama Prompt Guard 2 -- semantic injection classifier (Layer 2 of the
+# input guard). Returns a probability (0.0-1.0) that the message is a prompt
+# injection. Scores at/above LLAMAGUARD_THRESHOLD are treated as injection.
+LLAMAGUARD_MODEL      = "meta-llama/llama-prompt-guard-2-86m"
+LLAMAGUARD_MAX_TOKENS = 30
+LLAMAGUARD_THRESHOLD  = 0.5
+
+# INJECTION_PATTERNS -- regex strings to catch prompt injection / jailbreak
+# attempts. Each pattern is matched case-insensitively against the patient
+# message. A match blocks the message before any LLM call, including the
+# classifier.
+INJECTION_PATTERNS: list[str] = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"forget\s+everything",
+    r"\byou\s+are\s+now\b",
+    r"disregard\s+your\s+(system\s+)?prompt",
+    r"act\s+as\s+(if\s+you\s+(are|were)|a\s+(\w+\s+)+with\s+no)",
+    r"roleplay\s+as",
+    r"pretend\s+(to\s+be|you\s+(are|were))",
+    r"(reveal|tell|show|print|display)\s+(me\s+)?(your\s+)?(full\s+)?(system\s+prompt|instructions|prompt)",
+    r"new\s+(persona|identity|role)\b",
+]
+
+# PII_PATTERNS -- regex strings to catch Aadhaar or PAN numbers a patient
+# types into the chat. A match blocks the message (DPDP Act 2023 compliance --
+# patient identifiers must never reach the LLM or be logged in history).
+PII_PATTERNS: list[str] = [
+    r"\b\d{4}\s?\d{4}\s?\d{4}\b",   # Aadhaar: 12 digits (spaces optional)
+    r"\b[A-Z]{5}\d{4}[A-Z]\b",       # PAN: ABCDE1234F
+]
+
+# Canned responses for blocked messages.
+GUARD_BLOCKED_RESPONSE = (
+    "I can only assist with Apollo Health Clinic services. "
+    "Please ask me about appointments, departments, or clinic information.\n\n"
+    "ClinicalIQ | Apollo Health Clinic"
+)
+
+GUARD_PII_RESPONSE = (
+    "I cannot process or retain personal identification numbers. "
+    "Please contact reception directly for patient-record queries.\n\n"
+    "ClinicalIQ | Apollo Health Clinic"
+)
+
+# LlamaGuard blocks use the same response as injection blocks.
+GUARD_UNSAFE_RESPONSE = GUARD_BLOCKED_RESPONSE
+
 # US-11: two specialist categories replace the old single IN_SCOPE bucket --
 # SERVICES needs the live doctor/service database (query_doctor/query_service
 # via MCP), POLICY needs the ChromaDB policy documents. See nodes.py's
@@ -254,7 +322,8 @@ MAX_QUERY_LENGTH = 500
 _CLASSIFY_CATEGORIES = """SERVICES     : A question about doctor availability, schedules, consultation fees,
                or lab test/health package pricing -- needs the live clinic database.
                Examples: "When is the Cardiology department open?", "What is the latest appointment time?",
-               "How much does an MRI scan cost?", "Which doctors are available today?"
+               "How much does an MRI scan cost?", "Which doctors are available today?",
+               "What is the consultation fee?", "How much does a consultation cost?"
 
 POLICY       : A question about clinic policies, appointment procedures, department
                navigation, test preparation, or general clinic information.

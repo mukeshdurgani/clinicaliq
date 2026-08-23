@@ -23,9 +23,32 @@ from .config import (
     EMBED_MODEL,VECTORSTORE_DIR, RETRIEVAL_K,RETRIEVAL_SCORE_THRESHOLD,
     ESCALATE_ROUTING_ENABLED, ESCALATE_KEYWORD_PATTERNS, COMPLIANCE_BANNED_PHRASES, DB_PATH,
     SAFE_COMPLIANCE_RESPONSE, PROMPT_INJECTION_BLOCKLIST, MIN_QUERY_LENGTH, MAX_QUERY_LENGTH,
+    GUARD_BLOCKED_RESPONSE, GUARD_PII_RESPONSE, GUARD_UNSAFE_RESPONSE,
+    INJECTION_PATTERNS, PII_PATTERNS, LLAMAGUARD_THRESHOLD,
 )
 from .state import ClinicalIQState
-from .tools import classifier_llm, llm, llm_with_tools, _run_tool
+from .tools import classifier_llm, llamaguard_llm, llm, llm_with_tools, _run_tool
+
+# ---------------------------------------------------------------------------
+# S14: two-layer input guard (ported from WealthDesk's s14 nodes.py)
+# ---------------------------------------------------------------------------
+# Pre-compile guard patterns once at module load -- avoids re-compilation
+# overhead on every request.
+_pii_compiled       = [re.compile(p)               for p in PII_PATTERNS]
+_injection_compiled = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+# OWASP LLM01:2026 mitigation -- strip invisible Unicode used to smuggle
+# injection payloads invisibly: tag-block (U+E0000-E007F), variation-selector
+# (U+FE00-FE0F), and zero-width characters (U+200B/C/D, U+2060). Applied
+# before NFKD normalization in guard(). Built from explicit codepoints via
+# chr() rather than a regex literal containing invisible glyphs pasted into
+# source, which would be unreviewable in a diff or editor.
+_INVISIBLE_RANGES  = [(0xE0000, 0xE007F), (0xFE00, 0xFE0F)]
+_INVISIBLE_SINGLES = [0x200B, 0x200C, 0x200D, 0x2060]
+_invisible_chars = "".join(
+    chr(cp) for lo, hi in _INVISIBLE_RANGES for cp in range(lo, hi + 1)
+) + "".join(chr(cp) for cp in _INVISIBLE_SINGLES)
+_INVISIBLE_UNICODE_RE = re.compile("[" + re.escape(_invisible_chars) + "]")
 
 # ---------------------------------------------------------------------------
 # Streamlit UI: token streaming hook (ported from WealthDesk's s13 nodes.py)
@@ -143,6 +166,95 @@ def _check_compliance(draft: str) -> tuple:
 #                      agent never crashes mid-conversation.
 #
 # ---------------------------------------------------------------------------
+
+def _llamaguard_safe(message: str) -> bool:
+    """Call Llama Prompt Guard 2 via Groq and return True if message is safe.
+
+    result.content is a float string -- the injection probability (e.g.
+    "0.9996"). Fails open (returns True) on any error so a Groq outage never
+    blocks a legitimate patient query -- the regex layer in guard() still ran
+    first and already caught the obvious cases."""
+    try:
+        result = llamaguard_llm.invoke([HumanMessage(content=message)])
+        score  = float(result.content.strip())
+        safe   = score < LLAMAGUARD_THRESHOLD
+        print(f"[ClinicalIQ] LlamaPromptGuard: score={score:.4f} -> {'safe' if safe else 'INJECTION'}")
+        return safe
+    except Exception as e:
+        print(f"[ClinicalIQ] LlamaPromptGuard unavailable — defaulting to safe: {e}")
+        return True
+
+
+@traceable(name="input_guard")
+def guard(state: ClinicalIQState) -> dict:
+    """Graph entry point (S14): inspect customer_message for PII, injection
+    patterns, and unsafe content before any specialist or classifier LLM runs.
+
+    Two-layer defence:
+      Layer 1 (regex, < 1 ms):
+        1a. PII_PATTERNS   -> {"blocked_reason": "pii"}
+        1b. INJECTION_PATTERNS -> {"blocked_reason": "injection"}
+      Layer 2 (LlamaGuard, semantic):
+        2.  _llamaguard_safe(msg) is False -> {"blocked_reason": "llamaguard"}
+
+    Returns {"blocked_reason": ""} if all layers pass.
+    """
+    raw = state["customer_message"]
+
+    # OWASP LLM01:2026 mitigations applied in order:
+    #   1. Strip invisible Unicode (tag-block, variation-selector, zero-width)
+    #      that can smuggle injections invisibly.
+    #   2. NFKD normalization collapses compatibility characters (full-width
+    #      digits, mathematical bold) before regex matching.
+    # Neither step catches Cyrillic homoglyphs -- Layer 2 handles many of those.
+    msg = unicodedata.normalize("NFKD", _INVISIBLE_UNICODE_RE.sub("", raw))
+
+    # Layer 1a: PII -- identifier must not reach the LLM.
+    # PAN is uppercase only; no IGNORECASE (lowercase is not a valid PAN card format).
+    for rx in _pii_compiled:
+        if rx.search(msg):
+            print("[ClinicalIQ] Guard: PII detected — blocked")
+            return {"blocked_reason": "pii"}
+
+    # Layer 1b: Injection / jailbreak / persona-hijack -- always case-insensitive.
+    for rx in _injection_compiled:
+        if rx.search(msg):
+            print("[ClinicalIQ] Guard: injection (regex) detected — blocked")
+            return {"blocked_reason": "injection"}
+
+    # Layer 2: Llama Prompt Guard 2 -- semantic injection detection.
+    if not _llamaguard_safe(msg):
+        print("[ClinicalIQ] Guard: jailbreak (LlamaPromptGuard) detected — blocked")
+        return {"blocked_reason": "llamaguard"}
+
+    return {"blocked_reason": ""}
+
+
+def blocked(state: ClinicalIQState) -> dict:
+    """Returns the canned response matching state['blocked_reason'], set by
+    guard(). Ends the turn without ever reaching classify() or an LLM."""
+    reason = state.get("blocked_reason", "injection")
+    if reason == "pii":
+        response = GUARD_PII_RESPONSE
+    elif reason == "llamaguard":
+        response = GUARD_UNSAFE_RESPONSE
+    else:
+        response = GUARD_BLOCKED_RESPONSE
+    return {
+        "response":   response,
+        "specialist": "guard",
+        "history": state.get("history", []) + [
+            {"role": "user",      "content": state["customer_message"]},
+            {"role": "assistant", "content": response},
+        ],
+    }
+
+
+def route_guard(state: ClinicalIQState) -> str:
+    """Routing function for the "guard" node: "blocked" if guard() flagged
+    the message, else "classify"."""
+    return "blocked" if state.get("blocked_reason") else "classify"
+
 
 def _init_vectorstore() -> None:
     global vectorstore

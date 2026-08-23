@@ -7,8 +7,10 @@ Run the agent from the session folder:
     cd s01/
     python -m clinicaliq.agent
 
-US-11 supervisor graph (mirrors WealthDesk's s10 pattern):
-    START --> classify --> route_supervisor -->
+S14 guard + US-11 supervisor graph (mirrors WealthDesk's s14 pattern):
+    START --> guard --> route_guard --> {classify | blocked}
+    blocked  --> END   (static response, skips classify/compliance entirely)
+    classify --> route_supervisor -->
         {call_documents_agent | call_services_agent | escalate | decline}
     call_documents_agent --> call_compliance_agent --> END
     call_services_agent  --> call_compliance_agent --> END
@@ -28,16 +30,18 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from .nodes import (
-    call_compliance_agent, call_documents_agent, call_services_agent,
-    classify, decline, escalate, route_supervisor,
+    blocked, call_compliance_agent, call_documents_agent, call_services_agent,
+    classify, decline, escalate, guard, route_guard, route_supervisor,
 )
 from .state import ClinicalIQState
 from .config import CHECKPOINT_DB, ESCALATE_RESPONSE, MCP_SERVER_PATH
 
 
 def build_graph(checkpointer=None):
-    """Build and compile the ClinicalIQ supervisor graph (US-11)."""
+    """Build and compile the ClinicalIQ supervisor graph (US-11 + S14 guard)."""
     builder = StateGraph(ClinicalIQState)
+    builder.add_node("guard",                             guard)    # S14: PII/injection/LlamaGuard input guard
+    builder.add_node("blocked",                           blocked)  # S14: canned response for a guard-blocked turn
     builder.add_node("classify",                         classify)
     builder.add_node("call_documents_agent [subgraph]",  call_documents_agent)
     builder.add_node("call_services_agent [subgraph]",   call_services_agent)
@@ -45,7 +49,13 @@ def build_graph(checkpointer=None):
     builder.add_node("decline",                           decline)
     builder.add_node("call_compliance_agent [subgraph]",  call_compliance_agent)  # US-08: critique-revise guardrail on a specialist's draft
 
-    builder.set_entry_point("classify") # START
+    builder.set_entry_point("guard") # START
+    builder.add_conditional_edges("guard", route_guard, {
+        "classify": "classify",
+        "blocked":  "blocked",
+    })
+    builder.add_edge("blocked", END)
+
     builder.add_conditional_edges("classify", route_supervisor, {
         "call_documents_agent": "call_documents_agent [subgraph]",
         "call_services_agent":  "call_services_agent [subgraph]",
@@ -112,21 +122,26 @@ def run() -> None:
         # overwrites it; graph.invoke() returns the full merged state.
         result = _graph.invoke(
             {"customer_message": user_input, "response": "",
-             "compliance_status": "", "specialist": ""},
+             "compliance_status": "", "specialist": "", "blocked_reason": ""},
             config=config,
         )
-        route      = result.get("query_type", "?")
-        specialist = result.get("specialist", "?")
-        docs       = result.get("retrieved_docs", [])
-        compliance = result.get("compliance_status", "")
-        response   = result["response"]
-        print(f"\n[Routed: {route} -> {specialist}]", end="")
-        if docs and response != ESCALATE_RESPONSE:
-            sources = {d.split("]\n")[0].lstrip("[") for d in docs if "]\n" in d}
-            print(f"  [Retrieved {len(docs)} chunk(s) from: {', '.join(sorted(sources))}]", end="")
-        if compliance:
-            print(f"  [Compliance: {compliance}]", end="")
-        print()
+
+        blocked_reason = result.get("blocked_reason", "")
+        if blocked_reason:
+            print(f"\n[Guard: BLOCKED ({blocked_reason})]")
+        else:
+            route      = result.get("query_type", "?")
+            specialist = result.get("specialist", "?")
+            docs       = result.get("retrieved_docs", [])
+            compliance = result.get("compliance_status", "")
+            response   = result["response"]
+            print(f"\n[Routed: {route} -> {specialist}]", end="")
+            if docs and response != ESCALATE_RESPONSE:
+                sources = {d.split("]\n")[0].lstrip("[") for d in docs if "]\n" in d}
+                print(f"  [Retrieved {len(docs)} chunk(s) from: {', '.join(sorted(sources))}]", end="")
+            if compliance:
+                print(f"  [Compliance: {compliance}]", end="")
+            print()
         print(f"\nClinicalIQ: {result['response']}")
 
 
