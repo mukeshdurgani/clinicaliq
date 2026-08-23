@@ -69,12 +69,25 @@ def build_input_state(message: str) -> dict:
         "specialist":        "",       # which agent handled the query
         "retrieved_docs":    [],       # RAG chunks -- reset each turn to avoid leakage
         "compliance_status": "",       # PASS, REVISED, or FAIL:... -- set by the compliance agent
+        "blocked_reason":    "",       # "" | injection | pii | llamaguard -- set by guard() (S14)
     }
 
 
 def get_thread_config(thread_id: str) -> dict:
     """LangGraph needs a thread ID to keep memory across turns in the same session."""
     return {"configurable": {"thread_id": thread_id}}
+
+
+def guard_badge(reason: str) -> str:
+    """S14: display text for a guard()-blocked turn. Empty string for a clean
+    (unblocked) turn, mirroring compliance_badge()'s "no badge" convention."""
+    if reason == "injection":
+        return "🛡️ Blocked (prompt injection)"
+    if reason == "pii":
+        return "🔒 Blocked (PII detected)"
+    if reason == "llamaguard":
+        return "🤖 Blocked (LlamaGuard)"
+    return ""
 
 
 def compliance_badge(status: str) -> str:
@@ -94,6 +107,11 @@ def needs_human_review(result: dict) -> bool:
 
 
 def format_route_label(result: dict) -> str:
+    blocked_reason = result.get("blocked_reason", "")
+    if blocked_reason:
+        # S14: a guard-blocked turn never reaches classify()/compliance --
+        # show the guard badge instead of a specialist route.
+        return f"Route: guard | {guard_badge(blocked_reason)}"
     sp    = result.get("specialist", "—")    # e.g. "documents_agent", "services_agent"
     cs    = result.get("compliance_status", "")
     badge = compliance_badge(cs)
@@ -130,6 +148,7 @@ def _sidebar() -> None:
         st.divider()
         st.subheader("Agents")
         st.markdown(
+            "- **Guard** — blocks PII / prompt injection before any LLM runs\n"
             "- **Supervisor** — classifies query\n"
             "- **Documents Agent** — handles policy & procedure questions\n"
             "- **Services Agent** — handles doctor & service queries (live data)\n"
