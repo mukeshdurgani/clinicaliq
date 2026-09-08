@@ -82,11 +82,17 @@ graph = build_graph()
 # Terminal loop (provided -- no changes needed)
 # ---------------------------------------------------------------------------
 
-def run() -> None:
+def run(user_id: str = "cli") -> None:
     import os
     conn = sqlite3.connect(str(CHECKPOINT_DB), check_same_thread=False)
-    _graph    = build_graph(checkpointer=SqliteSaver(conn))  # terminal app opts into disk persistence explicit
-    thread_id = str(uuid4())
+    _graph = build_graph(checkpointer=SqliteSaver(conn))  # terminal app opts into disk persistence explicit
+
+    # ASI03:2026 Identity & Privilege Abuse -- prefix thread_id with user_id so
+    # checkpoints from different patients are namespaced in the shared SQLite
+    # store. Prevents cross-patient memory access even if an attacker guesses
+    # a UUID (default "cli" is the single-user terminal case; a multi-user
+    # front end would pass its own authenticated user_id here).
+    thread_id = f"{user_id}::{uuid4()}"
     config    = {"configurable": {"thread_id": thread_id}}
 
     if not MCP_SERVER_PATH.exists():

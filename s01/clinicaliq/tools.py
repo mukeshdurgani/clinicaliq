@@ -61,6 +61,12 @@ llamaguard_llm = ChatGroq(
 # to a connection config. For a stdio server: "command" is the interpreter to run
 # it with (sys.executable -- the same Python running this process) and "args" is
 # the script path.
+
+# ASI02:2026 Tool Misuse & Exploitation -- both MCP tools (query_doctor,
+# query_service) are READ-ONLY SQLite queries. No write, update, or booking
+# operation exists. This bounds the blast radius: even if a prompt injection
+# slips past the S14 guard, the agent cannot modify patient records, alter
+# doctor schedules, or place bookings via tool calls.
 _mcp_client = MultiServerMCPClient({
     "clinicaliq": {
         "transport": "stdio",

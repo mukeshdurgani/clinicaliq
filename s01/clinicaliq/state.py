@@ -33,6 +33,8 @@ class ClinicalIQState(TypedDict):
     compliance_status: str      # "PASS" or "FAIL: <reason>" -- set by nodes.check_compliance()
     specialist: str             # which agent handled this turn: "documents_agent" | "services_agent" | "escalated" | "declined" | "guard"
     blocked_reason: str         # "" = clean; "injection" | "pii" | "llamaguard" -- set by nodes.guard() (S14)
+    llamaguard_score: float     # LlamaGuard injection-probability score (S14); -1.0 = Layer 2 never ran
+                                 # (blocked earlier by a regex layer) or the Groq call failed
 
 # Guard: raises at import time if the fields haven't been defined yet.
 if "customer_message" not in ClinicalIQState.__annotations__:

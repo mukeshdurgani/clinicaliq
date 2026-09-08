@@ -167,22 +167,24 @@ def _check_compliance(draft: str) -> tuple:
 #
 # ---------------------------------------------------------------------------
 
-def _llamaguard_safe(message: str) -> bool:
-    """Call Llama Prompt Guard 2 via Groq and return True if message is safe.
+def _llamaguard_safe(message: str) -> tuple:
+    """Call Llama Prompt Guard 2 via Groq and return (safe, score).
 
     result.content is a float string -- the injection probability (e.g.
-    "0.9996"). Fails open (returns True) on any error so a Groq outage never
-    blocks a legitimate patient query -- the regex layer in guard() still ran
-    first and already caught the obvious cases."""
+    "0.9996"). Fails open (returns True, -1.0) on any error so a Groq outage
+    never blocks a legitimate patient query -- the regex layer in guard()
+    still ran first and already caught the obvious cases. The score is
+    surfaced (not just the bool) so guard() can record it on state for
+    observability/tracing -- see llamaguard_score in state.py."""
     try:
         result = llamaguard_llm.invoke([HumanMessage(content=message)])
         score  = float(result.content.strip())
         safe   = score < LLAMAGUARD_THRESHOLD
         print(f"[ClinicalIQ] LlamaPromptGuard: score={score:.4f} -> {'safe' if safe else 'INJECTION'}")
-        return safe
+        return safe, score
     except Exception as e:
         print(f"[ClinicalIQ] LlamaPromptGuard unavailable — defaulting to safe: {e}")
-        return True
+        return True, -1.0
 
 
 @traceable(name="input_guard")
@@ -214,20 +216,22 @@ def guard(state: ClinicalIQState) -> dict:
     for rx in _pii_compiled:
         if rx.search(msg):
             print("[ClinicalIQ] Guard: PII detected — blocked")
-            return {"blocked_reason": "pii"}
+            # Layer 2 never ran -- no score to report.
+            return {"blocked_reason": "pii", "llamaguard_score": -1.0}
 
     # Layer 1b: Injection / jailbreak / persona-hijack -- always case-insensitive.
     for rx in _injection_compiled:
         if rx.search(msg):
             print("[ClinicalIQ] Guard: injection (regex) detected — blocked")
-            return {"blocked_reason": "injection"}
+            return {"blocked_reason": "injection", "llamaguard_score": -1.0}
 
     # Layer 2: Llama Prompt Guard 2 -- semantic injection detection.
-    if not _llamaguard_safe(msg):
+    safe, score = _llamaguard_safe(msg)
+    if not safe:
         print("[ClinicalIQ] Guard: jailbreak (LlamaPromptGuard) detected — blocked")
-        return {"blocked_reason": "llamaguard"}
+        return {"blocked_reason": "llamaguard", "llamaguard_score": score}
 
-    return {"blocked_reason": ""}
+    return {"blocked_reason": "", "llamaguard_score": score}
 
 
 def blocked(state: ClinicalIQState) -> dict:
@@ -620,6 +624,11 @@ def create_compliance_agent():
 _compliance_agent = create_compliance_agent()
 
 
+# ASI08:2026 Cascading Failures -- the Compliance Agent is the circuit-breaker:
+# every specialist LLM draft is validated here before it can leave the graph.
+# A hallucinated price or a banned diagnosis/medication/outcome-promise phrase
+# is caught and revised in this one place, preventing one bad LLM call from
+# cascading into a patient-safety incident.
 def call_compliance_agent(state: ClinicalIQState) -> dict:
     """Supervisor node that invokes the Compliance Agent subgraph on the
     specialist's draft response, before the graph ends -- escalate()/decline()
@@ -641,6 +650,11 @@ def call_compliance_agent(state: ClinicalIQState) -> dict:
     }
 
 
+# ASI09:2026 Human-Agent Trust Exploitation -- for queries that describe
+# symptoms, request a diagnosis/medication, or sound like an emergency, the
+# agent never attempts an answer. It routes straight to a human doctor/nurse,
+# preventing automation bias from substituting an LLM's guess for the medical
+# judgement only a clinician should make.
 def escalate(state: ClinicalIQState) -> dict:
     new_history = state.get("history", []) + [
         {"role": "user",      "content": state["customer_message"]},
