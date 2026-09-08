@@ -22,7 +22,12 @@ from pathlib import Path
 
 MODEL_NAME  = "openai/gpt-oss-20b"
 TEMPERATURE = 0.3
-MAX_TOKENS  = 300
+# 300 truncated a 7-doctor roster listing mid-sentence in testing -- even with
+# reasoning_effort="low" on `llm` (tools.py) reserving more of the budget for
+# the visible answer, a full doctor list plus the ~150-word response the
+# system prompt asks for needs headroom above 300. 500 leaves margin without
+# letting a single response run unreasonably long.
+MAX_TOKENS  = 500
 
 # openai/gpt-oss-20b is a reasoning model -- it spends completion tokens on
 # hidden chain-of-thought (response_metadata['reasoning_content']) before ever

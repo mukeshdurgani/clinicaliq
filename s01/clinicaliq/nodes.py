@@ -421,6 +421,17 @@ def _doc_respond(state: ClinicalIQState) -> dict:
     return {"response": response_text, "history": new_history}
 
 
+# KNOWN LIMITATION (observed during S15 Docker testing): whether to call
+# query_doctor() with no filters for a vague roster question (e.g. "which
+# all doctors are part of the roster?") is left to llm_with_tools's own
+# judgement, not forced deterministically. At TEMPERATURE=0.3 this is
+# non-deterministic -- repeated identical queries sometimes list all doctors
+# and sometimes decline with "I can only help with services related to
+# Apollo Health Clinic" instead of calling the tool. SYSTEM_PROMPT rule 5
+# (config.py) only says to call query_doctor for doctor questions -- it
+# doesn't explicitly cover the no-filter/"list everyone" case. Not hardened
+# yet -- would need an explicit SYSTEM_PROMPT rule (or a deterministic
+# pre-filter like the ESCALATE one in classify()) to fix.
 def _services_respond(state: ClinicalIQState) -> dict:
     """Services Agent's respond step: MCP tools (query_doctor/query_service),
     no ChromaDB context. Same multi-round tool-calling loop the old respond()

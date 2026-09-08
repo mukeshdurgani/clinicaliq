@@ -35,6 +35,11 @@ llm = ChatGroq(
     model=MODEL_NAME,
     temperature=TEMPERATURE,
     max_tokens=MAX_TOKENS,
+    reasoning_effort="low",  # openai/gpt-oss-20b spends completion tokens on hidden
+    # chain-of-thought before the visible answer (same issue classifier_MAX_TOKENS
+    # documents) -- observed truncating a 7-doctor roster list mid-sentence at the
+    # old MAX_TOKENS=300 with default (higher) reasoning effort. Low effort leaves
+    # more of the budget for the actual up-to-150-word response.
 )
 
 classifier_llm = ChatGroq(
