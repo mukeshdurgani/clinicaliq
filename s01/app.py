@@ -11,6 +11,7 @@ token-streaming hook (nodes.py's _stream_callback) for a typewriter effect.
 Run from inside s01/:
     streamlit run app.py
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,26 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# S15: Graceful API key check
+#
+# Validate GROQ_API_KEY BEFORE importing clinicaliq. The package reads the
+# key at module load time (clinicaliq/tools.py raises ValueError if it is
+# missing). Without this guard, a missing key on Streamlit Community Cloud
+# or in a Docker container shows a raw Python traceback to the patient
+# instead of an actionable error message.
+# ---------------------------------------------------------------------------
+if not os.environ.get("GROQ_API_KEY"):
+    st.error(
+        "⚠️ **GROQ_API_KEY is not configured.**\n\n"
+        "- **Streamlit Community Cloud:** go to *Settings → Secrets* and add:\n"
+        "  ```\n  GROQ_API_KEY = \"gsk_...\"\n  ```\n"
+        "- **Docker:** `docker run -p 8501:8501 -e GROQ_API_KEY=gsk_... clinicaliq`  \n"
+        "  or `docker run -p 8501:8501 --env-file .env clinicaliq`\n"
+        "- **Local dev:** copy `.env.example` to `.env` and fill in your key"
+    )
+    st.stop()
 
 from clinicaliq.agent import build_graph  # noqa: E402
 from clinicaliq.config import SAFE_COMPLIANCE_RESPONSE  # noqa: E402
