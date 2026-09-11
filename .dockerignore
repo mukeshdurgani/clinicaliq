@@ -1,0 +1,47 @@
+# Never include secrets or local artefacts in the Docker build context.
+# Files listed here are invisible to all COPY instructions in the Dockerfile.
+
+# Secrets — must never reach the image
+.env
+.env.*
+!.env.example
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Local runtime data (rebuilt inside the container by data/seed.py / data/ingest.py)
+data/clinic_data.db
+data/checkpoint.db
+data/checkpoints.db
+data/checkpoints.db-shm
+data/checkpoints.db-wal
+data/vectorstore/
+
+# Eval dataset/runner — not needed by the running Streamlit app
+data/evals/
+
+# Leftover editor backup files
+s01/clinicaliq/*.orig
+
+# Tests — not needed inside the runtime image
+s01/tests/
+s01/.pytest_cache/
+.pytest_cache/
+
+# LangGraph dev server state
+s01/.langgraph_api/
+
+# Git and IDE files
+.git/
+.idea/
+.vscode/
+*.egg-info/
+.venv/
+venv/
+
+# macOS noise
+.DS_Store
